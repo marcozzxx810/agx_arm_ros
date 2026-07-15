@@ -4,6 +4,7 @@ import time
 import rclpy
 import math
 import threading
+import re
 from typing import Optional
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, PiperFW, NeroFW
 from rclpy.node import Node
@@ -108,6 +109,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("gripper_default_effort", 1.0)
         self.declare_parameter("control_enabled", True)
+        self.declare_parameter("physical_mode", "unchanged")
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -122,11 +124,21 @@ class AgxArmRosNode(Node):
         self.tcp_offset = self.get_parameter("tcp_offset").value
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
         self.control_enabled = self.get_parameter("control_enabled").value
+        self.physical_mode = self.get_parameter("physical_mode").value
 
         if self.arm_type not in ArmModel.__dict__.values():
             self.get_logger().error(
                 f"Unsupported arm_type '{self.arm_type}', expected one of {list(ArmModel.__dict__.values())}."
             )
+            exit(1)
+
+        if self.physical_mode not in ("unchanged", "leader", "follower"):
+            self.get_logger().error(
+                f"Unsupported physical_mode '{self.physical_mode}'"
+            )
+            exit(1)
+        if self.physical_mode != "unchanged" and self.arm_type != ArmModel.NERO:
+            self.get_logger().error("physical_mode is only supported for NERO")
             exit(1)
 
         if self.gripper_default_effort < 0:
@@ -162,6 +174,47 @@ class AgxArmRosNode(Node):
         self.get_logger().info(f"tcp_offset: {self.tcp_offset}")
         self.get_logger().info(f"gripper_default_effort: {self.gripper_default_effort}")
         self.get_logger().info(f"control_enabled: {self.control_enabled}")
+        self.get_logger().info(f"physical_mode: {self.physical_mode}")
+
+    def _nero_firmware_driver(self, version: str):
+        """Map the controller's numeric X.YY firmware string to an SDK driver."""
+        match = re.match(r"^\s*(\d+)\.(\d+)", version)
+        if match is None:
+            raise RuntimeError(f"Unsupported NERO firmware string: {version!r}")
+        parsed = (int(match.group(1)), int(match.group(2)))
+        if parsed >= (1, 20):
+            return NeroFW.V120
+        if parsed >= (1, 12):
+            return NeroFW.V112
+        if parsed == (1, 11):
+            return NeroFW.V111
+        return NeroFW.DEFAULT
+
+    def _configure_physical_mode(self):
+        if self.physical_mode == "unchanged":
+            return
+        if not self.enable_flag:
+            raise RuntimeError("arm must be enabled before setting physical_mode")
+
+        expected_ctrl_mode = 6 if self.physical_mode == "leader" else 1
+        if self.physical_mode == "leader":
+            self.agx_arm.set_leader_mode()
+        else:
+            self.agx_arm.set_follower_mode()
+
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < self.enable_timeout:
+            status = self.agx_arm.get_arm_status()
+            if status is not None and status.msg.ctrl_mode == expected_ctrl_mode:
+                self.get_logger().info(
+                    f"Physical NERO mode is now {self.physical_mode}"
+                )
+                return
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"Timed out verifying physical_mode={self.physical_mode}; "
+            f"expected ctrl_mode={expected_ctrl_mode}"
+        )
 
     def _init_agx_arm(self):
         config: PiperCanDefaultConfig = create_agx_arm_config(
@@ -199,10 +252,7 @@ class AgxArmRosNode(Node):
                 elif current_version >= "S-V1.8-8":
                     firmeware_version = PiperFW.V188
             elif self.is_nero:
-                if current_version == "1.11":
-                    firmeware_version = NeroFW.V111
-                elif current_version >= "1.12":
-                    firmeware_version = NeroFW.V112
+                firmeware_version = self._nero_firmware_driver(current_version)
             
             if firmeware_version != PiperFW.DEFAULT:
                 self.agx_arm.disconnect()
@@ -218,6 +268,7 @@ class AgxArmRosNode(Node):
 
         self.agx_arm.set_speed_percent(self.speed_percent)
         self.agx_arm.set_tcp_offset(self.tcp_offset)
+        self._configure_physical_mode()
 
     def _init_effector(self):
         self.gripper: Optional[AgxGripperWrapper] = None

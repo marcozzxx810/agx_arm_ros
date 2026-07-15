@@ -99,6 +99,13 @@ def generate_launch_description():
         description='Whether to accept /control/* commands.',
     )
 
+    physical_mode_arg = DeclareLaunchArgument(
+        'physical_mode',
+        default_value='unchanged',
+        choices=['unchanged', 'leader', 'follower'],
+        description='Physical NERO role; independent from the ROS namespace.',
+    )
+
     # node
     agx_arm_node = Node(
         package='agx_arm_ctrl',
@@ -120,6 +127,7 @@ def generate_launch_description():
             'tcp_offset': LaunchConfiguration('tcp_offset'),
             'gripper_default_effort': LaunchConfiguration('gripper_default_effort'),
             'control_enabled': LaunchConfiguration('control_enabled'),
+            'physical_mode': LaunchConfiguration('physical_mode'),
         }],
         remappings=[
             # feedback topics
@@ -166,6 +174,7 @@ def generate_launch_description():
         tcp_offset_arg,
         gripper_default_effort_arg,
         control_enabled_arg,
+        physical_mode_arg,
         # node
         agx_arm_node,
     ])
