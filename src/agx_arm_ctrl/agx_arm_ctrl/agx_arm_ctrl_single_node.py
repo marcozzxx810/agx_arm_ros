@@ -250,8 +250,16 @@ class AgxArmRosNode(Node):
             self.agx_arm.set_leader_mode()
         else:
             self.agx_arm.set_follower_mode()
+            # Changing linkage disables the normal CAN push on firmware 1.20.
+            # Re-enabling the already-powered joints restores follower status
+            # and measured-joint feedback without sending a joint target.
+            if not self._enable_arm(True, self.enable_timeout):
+                raise RuntimeError(
+                    "failed to restore NERO follower feedback after mode change"
+                )
 
         start_time = time.monotonic()
+        last_leader_request = start_time
         while time.monotonic() - start_time < self.enable_timeout:
             if self.physical_mode == "leader":
                 leader_joints = self.agx_arm.get_leader_joint_angles()
@@ -261,6 +269,9 @@ class AgxArmRosNode(Node):
                         "stream is active"
                     )
                     return
+                if time.monotonic() - last_leader_request >= 0.5:
+                    self.agx_arm.set_leader_mode()
+                    last_leader_request = time.monotonic()
                 time.sleep(0.01)
                 continue
 
@@ -287,7 +298,7 @@ class AgxArmRosNode(Node):
 
         if self.auto_enable:
             if not self._enable_arm(True, self.enable_timeout):
-                if self.is_nero and self.physical_mode == "leader":
+                if self.is_nero and self.physical_mode in ("leader", "follower"):
                     config = self._recover_persisted_nero_leader()
                 else:
                     raise RuntimeError("failed to auto-enable the arm")

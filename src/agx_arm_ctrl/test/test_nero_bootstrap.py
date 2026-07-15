@@ -146,6 +146,16 @@ def test_follower_mode_is_verified_by_control_status():
         get_logger=lambda: _Logger(),
     )
 
+    def enable(enable, timeout):
+        events.append(("enable", enable, timeout))
+        return True
+
+    subject._enable_arm = enable
+
     AgxArmRosNode._configure_physical_mode(subject)
 
-    assert events == ["set_follower_mode", "get_arm_status"]
+    assert events == [
+        "set_follower_mode",
+        ("enable", True, 0.1),
+        "get_arm_status",
+    ]
