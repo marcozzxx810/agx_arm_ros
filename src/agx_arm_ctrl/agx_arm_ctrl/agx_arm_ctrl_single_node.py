@@ -190,6 +190,56 @@ class AgxArmRosNode(Node):
             return NeroFW.V111
         return NeroFW.DEFAULT
 
+    def _recover_persisted_nero_leader(self):
+        """Restore request/response feedback when NERO boots in leader mode.
+
+        NERO firmware 1.12+ emits leader joint commands on 0x155/0x156/0x157
+        and 0x170 while in linkage mode, but suppresses the normal status and
+        firmware replies needed by the default bootstrap driver.  The V1.12
+        SDK driver understands that wire format.  Use the verified
+        set_follower_mode() API to recover normal feedback, enable the arm,
+        and leave final leader selection to _configure_physical_mode() after
+        exact firmware detection.
+        """
+        self.get_logger().warn(
+            "NERO did not answer the normal bootstrap and may be persisted in "
+            "leader mode. Temporarily requesting follower hold to recover "
+            "status and firmware feedback; keep the arm supported."
+        )
+        self.agx_arm.disconnect()
+        config = create_agx_arm_config(
+            robot=self.arm_type,
+            comm="can",
+            channel=self.can_port,
+            firmeware_version=NeroFW.V112,
+        )
+        self.agx_arm = AgxArmFactory.create_arm(config)
+        self.agx_arm.connect()
+
+        # The persisted leader is normally already enabled. Request follower
+        # first so normal status frames resume; request it again after enable
+        # because some controllers only apply linkage configuration when the
+        # joints are enabled.
+        self.agx_arm.set_follower_mode()
+        if not self._enable_arm(True, self.enable_timeout):
+            raise RuntimeError(
+                "failed to enable NERO while recovering persisted leader mode"
+            )
+        self.agx_arm.set_follower_mode()
+
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < self.enable_timeout:
+            status = self.agx_arm.get_arm_status()
+            if status is not None and status.msg.ctrl_mode == 1:
+                self.get_logger().info(
+                    "Recovered NERO follower feedback for firmware detection"
+                )
+                return config
+            time.sleep(0.01)
+        raise RuntimeError(
+            "timed out recovering follower feedback from persisted NERO leader mode"
+        )
+
     def _configure_physical_mode(self):
         if self.physical_mode == "unchanged":
             return
@@ -228,7 +278,10 @@ class AgxArmRosNode(Node):
 
         if self.auto_enable:
             if not self._enable_arm(True, self.enable_timeout):
-                self.get_logger().error("Failed to auto-enable the arm")
+                if self.is_nero and self.physical_mode == "leader":
+                    config = self._recover_persisted_nero_leader()
+                else:
+                    raise RuntimeError("failed to auto-enable the arm")
         else:
             time.sleep(0.1)
             self.enable_flag = self.agx_arm.get_joint_enable_status(255)
@@ -489,7 +542,10 @@ class AgxArmRosNode(Node):
                 if not self.control_ready and self._check_arm_ready():
                     self.control_ready = True
                     if not self._control_ready_logged:
-                        self.get_logger().info("Agx_arm feedback is ready, control is now enabled")
+                        self.get_logger().info(
+                            "Agx_arm feedback is ready; external control gate "
+                            f"is {'open' if self.control_enabled else 'closed'}"
+                        )
                         self._control_ready_logged = True
                 self._publish_joint_states()
                 self._publish_pose()
@@ -1010,7 +1066,8 @@ def main(args=None):
     except Exception as e:
         print(f"Error occurred: {e}")
     finally:
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
