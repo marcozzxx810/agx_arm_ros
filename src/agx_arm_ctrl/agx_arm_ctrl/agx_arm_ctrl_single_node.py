@@ -246,7 +246,6 @@ class AgxArmRosNode(Node):
         if not self.enable_flag:
             raise RuntimeError("arm must be enabled before setting physical_mode")
 
-        expected_ctrl_mode = 6 if self.physical_mode == "leader" else 1
         if self.physical_mode == "leader":
             self.agx_arm.set_leader_mode()
         else:
@@ -254,16 +253,26 @@ class AgxArmRosNode(Node):
 
         start_time = time.monotonic()
         while time.monotonic() - start_time < self.enable_timeout:
+            if self.physical_mode == "leader":
+                leader_joints = self.agx_arm.get_leader_joint_angles()
+                if leader_joints is not None and leader_joints.hz > 0:
+                    self.get_logger().info(
+                        "Physical NERO mode is now leader; leader joint "
+                        "stream is active"
+                    )
+                    return
+                time.sleep(0.01)
+                continue
+
             status = self.agx_arm.get_arm_status()
-            if status is not None and status.msg.ctrl_mode == expected_ctrl_mode:
+            if status is not None and status.msg.ctrl_mode == 1:
                 self.get_logger().info(
-                    f"Physical NERO mode is now {self.physical_mode}"
+                    "Physical NERO mode is now follower"
                 )
                 return
             time.sleep(0.01)
         raise RuntimeError(
-            f"Timed out verifying physical_mode={self.physical_mode}; "
-            f"expected ctrl_mode={expected_ctrl_mode}"
+            f"Timed out verifying physical_mode={self.physical_mode}"
         )
 
     def _init_agx_arm(self):

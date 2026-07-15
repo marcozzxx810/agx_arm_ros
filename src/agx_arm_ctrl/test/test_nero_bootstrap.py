@@ -98,3 +98,54 @@ def test_nero_firmware_driver_mapping():
         assert AgxArmRosNode._nero_firmware_driver(
             subject, firmware
         ) == expected_driver
+
+
+def test_leader_mode_is_verified_by_leader_joint_stream():
+    events = []
+
+    class Arm:
+        def set_leader_mode(self):
+            events.append("set_leader_mode")
+
+        def get_leader_joint_angles(self):
+            events.append("get_leader_joint_angles")
+            return SimpleNamespace(hz=200.0)
+
+        def get_arm_status(self):
+            raise AssertionError("leader mode disables normal status push")
+
+    subject = SimpleNamespace(
+        physical_mode="leader",
+        enable_flag=True,
+        enable_timeout=0.1,
+        agx_arm=Arm(),
+        get_logger=lambda: _Logger(),
+    )
+
+    AgxArmRosNode._configure_physical_mode(subject)
+
+    assert events == ["set_leader_mode", "get_leader_joint_angles"]
+
+
+def test_follower_mode_is_verified_by_control_status():
+    events = []
+
+    class Arm:
+        def set_follower_mode(self):
+            events.append("set_follower_mode")
+
+        def get_arm_status(self):
+            events.append("get_arm_status")
+            return SimpleNamespace(msg=SimpleNamespace(ctrl_mode=1))
+
+    subject = SimpleNamespace(
+        physical_mode="follower",
+        enable_flag=True,
+        enable_timeout=0.1,
+        agx_arm=Arm(),
+        get_logger=lambda: _Logger(),
+    )
+
+    AgxArmRosNode._configure_physical_mode(subject)
+
+    assert events == ["set_follower_mode", "get_arm_status"]
