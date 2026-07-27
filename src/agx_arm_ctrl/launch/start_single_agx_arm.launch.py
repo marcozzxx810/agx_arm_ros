@@ -106,6 +106,14 @@ def generate_launch_description():
         description='Physical NERO role; independent from the ROS namespace.',
     )
 
+    alignment_driver_state_rate_arg = DeclareLaunchArgument(
+        'alignment_driver_state_rate_hz',
+        default_value='5.0',
+        description=(
+            'Subscriber-gated low-rate alignment driver diagnostics in Hz.'
+        ),
+    )
+
     # node
     agx_arm_node = Node(
         package='agx_arm_ctrl',
@@ -128,11 +136,19 @@ def generate_launch_description():
             'gripper_default_effort': LaunchConfiguration('gripper_default_effort'),
             'control_enabled': LaunchConfiguration('control_enabled'),
             'physical_mode': LaunchConfiguration('physical_mode'),
+            'alignment_driver_state_rate_hz': LaunchConfiguration(
+                'alignment_driver_state_rate_hz'
+            ),
         }],
         remappings=[
             # feedback topics
             ('feedback/joint_states', 'feedback/joint_states'),
             ('feedback/joint_state_timing', 'feedback/joint_state_timing'),
+            ('feedback/alignment_command_timing', 'feedback/alignment_command_timing'),
+            ('feedback/alignment_motor_state', 'feedback/alignment_motor_state'),
+            ('feedback/alignment_joint_angle', 'feedback/alignment_joint_angle'),
+            ('feedback/alignment_driver_state', 'feedback/alignment_driver_state'),
+            ('feedback/alignment_arm_status', 'feedback/alignment_arm_status'),
             ('feedback/tcp_pose', 'feedback/tcp_pose'),
             ('feedback/arm_status', 'feedback/arm_status'),
             ('feedback/leader_joint_states', 'feedback/leader_joint_states'),
@@ -147,6 +163,7 @@ def generate_launch_description():
             ('control/move_c', 'control/move_c'),
             ('control/move_js', 'control/move_js'),
             ('control/move_mit', 'control/move_mit'),
+            ('get_alignment_metadata', 'get_alignment_metadata'),
             ('control/hand', 'control/hand'),
             ('control/hand_position_time', 'control/hand_position_time'),
 
@@ -176,6 +193,7 @@ def generate_launch_description():
         gripper_default_effort_arg,
         control_enabled_arg,
         physical_mode_arg,
+        alignment_driver_state_rate_arg,
         # node
         agx_arm_node,
     ])

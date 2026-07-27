@@ -1,0 +1,20 @@
+# One independently timestamped low-rate SDK driver-state observation.
+uint8 joint_index
+int64 sdk_timestamp_ns
+int64 receipt_ros_timestamp_ns
+int64 receipt_monotonic_ns
+float64 voltage_v
+float64 bus_current_a
+float64 foc_temperature_c
+float64 motor_temperature_c
+uint32 status_bits
+bool under_voltage
+bool motor_over_temperature
+bool driver_over_current
+bool driver_over_temperature
+bool collision
+bool driver_error
+bool enabled
+bool stall
+bool fresh
+bool valid

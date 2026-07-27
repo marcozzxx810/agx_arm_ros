@@ -5,7 +5,11 @@ import rclpy
 import math
 import threading
 import re
+import importlib.metadata
+from pathlib import Path
+import subprocess
 from typing import Optional
+import pyAgxArm
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, PiperFW, NeroFW
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -15,9 +19,24 @@ from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from scipy.spatial.transform import Rotation as R
 
 from agx_arm_msgs.msg import (
-    AgxArmStatus, GripperStatus,
+    AgxArmStatus, AlignmentCommandTiming, ArmStatusEvent, DriverStateEvent,
+    GripperStatus,
     HandStatus, HandCmd, HandPositionTimeCmd,
-    JointStateTiming, MoveMITMsg
+    JointAngleEvent, JointStateTiming, MotorStateEvent, MoveMITMsg
+)
+from agx_arm_msgs.srv import GetAlignmentMetadata
+from agx_arm_ctrl.alignment_diagnostics import (
+    FreshnessTracker,
+    REJECTION_GATE_CLOSED,
+    REJECTION_NONE,
+    REJECTION_NOT_ENABLED,
+    REJECTION_NOT_READY,
+    REJECTION_SDK_ERROR,
+    arm_status_values,
+    driver_state_values,
+    joint_angle_values,
+    motor_state_values,
+    parse_alignment_sequence,
 )
 from agx_arm_ctrl.effector import AgxGripperWrapper, Revo2Wrapper, Revo2TouchWrapper
 
@@ -110,6 +129,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("gripper_default_effort", 1.0)
         self.declare_parameter("control_enabled", True)
         self.declare_parameter("physical_mode", "unchanged")
+        self.declare_parameter("alignment_driver_state_rate_hz", 5.0)
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -125,6 +145,9 @@ class AgxArmRosNode(Node):
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
         self.control_enabled = self.get_parameter("control_enabled").value
         self.physical_mode = self.get_parameter("physical_mode").value
+        self.alignment_driver_state_rate_hz = float(
+            self.get_parameter("alignment_driver_state_rate_hz").value
+        )
 
         if self.arm_type not in ArmModel.__dict__.values():
             self.get_logger().error(
@@ -139,6 +162,9 @@ class AgxArmRosNode(Node):
             exit(1)
         if self.physical_mode != "unchanged" and self.arm_type != ArmModel.NERO:
             self.get_logger().error("physical_mode is only supported for NERO")
+            exit(1)
+        if self.alignment_driver_state_rate_hz <= 0.0:
+            self.get_logger().error("alignment_driver_state_rate_hz must be positive")
             exit(1)
 
         if self.gripper_default_effort < 0:
@@ -159,6 +185,8 @@ class AgxArmRosNode(Node):
         self.arm_joint_names = list()
         self.arm_joint_count = 0
         self._control_gate_block_logged = False
+        self._alignment_freshness = FreshnessTracker()
+        self._next_alignment_driver_state_monotonic = 0.0
 
     def _log_parameters(self):
         self.get_logger().info(f"can_port: {self.can_port}")
@@ -175,6 +203,10 @@ class AgxArmRosNode(Node):
         self.get_logger().info(f"gripper_default_effort: {self.gripper_default_effort}")
         self.get_logger().info(f"control_enabled: {self.control_enabled}")
         self.get_logger().info(f"physical_mode: {self.physical_mode}")
+        self.get_logger().info(
+            "alignment_driver_state_rate_hz: "
+            f"{self.alignment_driver_state_rate_hz}"
+        )
 
     def _nero_firmware_driver(self, version: str):
         """Map the controller's numeric X.YY firmware string to an SDK driver."""
@@ -341,6 +373,7 @@ class AgxArmRosNode(Node):
 
         self.agx_arm.set_speed_percent(self.speed_percent)
         self.agx_arm.set_tcp_offset(self.tcp_offset)
+        self.arm_config = config
         self._configure_physical_mode()
 
     def _init_effector(self):
@@ -391,6 +424,21 @@ class AgxArmRosNode(Node):
         )
         self.joint_state_timing_pub = self.create_publisher(
             JointStateTiming, "feedback/joint_state_timing", 20
+        )
+        self.alignment_command_timing_pub = self.create_publisher(
+            AlignmentCommandTiming, "feedback/alignment_command_timing", 200
+        )
+        self.alignment_motor_state_pub = self.create_publisher(
+            MotorStateEvent, "feedback/alignment_motor_state", 2000
+        )
+        self.alignment_joint_angle_pub = self.create_publisher(
+            JointAngleEvent, "feedback/alignment_joint_angle", 200
+        )
+        self.alignment_driver_state_pub = self.create_publisher(
+            DriverStateEvent, "feedback/alignment_driver_state", 100
+        )
+        self.alignment_arm_status_pub = self.create_publisher(
+            ArmStatusEvent, "feedback/alignment_arm_status", 200
         )
         # self.flange_pose_pub = self.create_publisher(
         #     PoseStamped, "feedback/flange_pose", 1
@@ -449,6 +497,11 @@ class AgxArmRosNode(Node):
         self.create_service(SetBool, "control_enable", self._control_gate_callback)
         self.create_service(Empty, "move_home", self._move_home_callback)
         self.create_service(Empty, "emergency_stop", self._emergency_stop_callback)
+        self.create_service(
+            GetAlignmentMetadata,
+            "get_alignment_metadata",
+            self._get_alignment_metadata_callback,
+        )
         if not self.is_switch_seamlessly:
             self.create_service(Empty, "exit_teach_mode", self._exit_teach_mode_callback)
 
@@ -459,6 +512,39 @@ class AgxArmRosNode(Node):
         ros_time.sec = int(timestamp)
         ros_time.nanosec = int((timestamp - ros_time.sec) * 1e9)
         return ros_time
+
+    def _ros_stamp_to_ns(self, stamp) -> int:
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    def _alignment_receipt_times(self):
+        return int(self.get_clock().now().nanoseconds), time.monotonic_ns()
+
+    def _publish_alignment_values(self, publisher, message_class, values):
+        if publisher.get_subscription_count() <= 0:
+            return
+        message = message_class()
+        for name, value in values.items():
+            setattr(message, name, value)
+        publisher.publish(message)
+
+    def _repository_commit(self, source_path: Path) -> tuple[str, bool]:
+        candidate = source_path.resolve()
+        for parent in (candidate, *candidate.parents):
+            if not (parent / ".git").exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(parent), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                break
+            commit = result.stdout.strip()
+            return commit, len(commit) == 40
+        return "", False
 
     def _safe_get_value(self, array, index, default=0.0) -> float:
         if index >= len(array):
@@ -575,6 +661,7 @@ class AgxArmRosNode(Node):
                 self._publish_arm_status()
                 self._publish_effector_status()
                 self._publish_leader_joint_states()
+                self._publish_alignment_driver_states_if_due()
             rate.sleep()
     
     ### publish methods
@@ -619,6 +706,20 @@ class AgxArmRosNode(Node):
 
     def _publish_joint_states(self):
         joint_states = self.agx_arm.get_joint_angles()
+        joint_receipt_ros_ns, joint_receipt_monotonic_ns = (
+            self._alignment_receipt_times()
+        )
+        if self.alignment_joint_angle_pub.get_subscription_count() > 0:
+            self._publish_alignment_values(
+                self.alignment_joint_angle_pub,
+                JointAngleEvent,
+                joint_angle_values(
+                    joint_states,
+                    joint_receipt_ros_ns,
+                    joint_receipt_monotonic_ns,
+                    self._alignment_freshness,
+                ),
+            )
         if joint_states is None or joint_states.hz <= 0:
             return
 
@@ -627,6 +728,21 @@ class AgxArmRosNode(Node):
         motor_hardware_stamps = []
         for joint_index in range(1, self.arm_joint_count+1):
             ms = self.agx_arm.get_motor_states(joint_index)
+            motor_receipt_ros_ns, motor_receipt_monotonic_ns = (
+                self._alignment_receipt_times()
+            )
+            if self.alignment_motor_state_pub.get_subscription_count() > 0:
+                self._publish_alignment_values(
+                    self.alignment_motor_state_pub,
+                    MotorStateEvent,
+                    motor_state_values(
+                        joint_index,
+                        ms,
+                        motor_receipt_ros_ns,
+                        motor_receipt_monotonic_ns,
+                        self._alignment_freshness,
+                    ),
+                )
             if ms is None:
                 return
             velocitys.append(ms.msg.velocity)
@@ -691,6 +807,18 @@ class AgxArmRosNode(Node):
 
     def _publish_arm_status(self):
         arm_status = self.agx_arm.get_arm_status()
+        receipt_ros_ns, receipt_monotonic_ns = self._alignment_receipt_times()
+        if self.alignment_arm_status_pub.get_subscription_count() > 0:
+            self._publish_alignment_values(
+                self.alignment_arm_status_pub,
+                ArmStatusEvent,
+                arm_status_values(
+                    arm_status,
+                    receipt_ros_ns,
+                    receipt_monotonic_ns,
+                    self._alignment_freshness,
+                ),
+            )
         if arm_status is None:
             return
 
@@ -710,6 +838,32 @@ class AgxArmRosNode(Node):
             msg.communication_status_joint.append(comm_status)
 
         self.arm_status_pub.publish(msg)
+
+    def _publish_alignment_driver_states_if_due(self):
+        if self.alignment_driver_state_pub.get_subscription_count() <= 0:
+            return
+        now = time.monotonic()
+        if now < self._next_alignment_driver_state_monotonic:
+            return
+        self._next_alignment_driver_state_monotonic = (
+            now + 1.0 / self.alignment_driver_state_rate_hz
+        )
+        for joint_index in range(1, self.arm_joint_count + 1):
+            sample = self.agx_arm.get_driver_states(joint_index)
+            receipt_ros_ns, receipt_monotonic_ns = (
+                self._alignment_receipt_times()
+            )
+            self._publish_alignment_values(
+                self.alignment_driver_state_pub,
+                DriverStateEvent,
+                driver_state_values(
+                    joint_index,
+                    sample,
+                    receipt_ros_ns,
+                    receipt_monotonic_ns,
+                    self._alignment_freshness,
+                ),
+            )
 
     def _publish_leader_joint_states(self):
         leader_joint_angles = self.agx_arm.get_leader_joint_angles()
@@ -897,15 +1051,103 @@ class AgxArmRosNode(Node):
         self.is_mit_mode = False
 
     def _move_js_callback(self, msg: JointState):
+        sequence_id = parse_alignment_sequence(msg.header.frame_id)
+        callback_ros_ns = -1
+        callback_monotonic_ns = -1
+        if sequence_id is not None:
+            callback_ros_ns, callback_monotonic_ns = (
+                self._alignment_receipt_times()
+            )
+        original_stamp_ns = self._ros_stamp_to_ns(msg.header.stamp)
+        sdk_start_ns = -1
+        sdk_end_ns = -1
+        accepted = False
+        rejection_code = REJECTION_NONE
+        rejection_reason = ""
+
         if not self._check_can_control():
+            if not self.control_ready:
+                rejection_code = REJECTION_NOT_READY
+                rejection_reason = "driver feedback is not ready"
+            elif not self.enable_flag:
+                rejection_code = REJECTION_NOT_ENABLED
+                rejection_reason = "arm is not enabled"
+            elif not self.control_enabled:
+                rejection_code = REJECTION_GATE_CLOSED
+                rejection_reason = "external control gate is closed"
+            else:
+                rejection_code = REJECTION_NOT_READY
+                rejection_reason = "driver control preflight rejected command"
+            if sequence_id is not None:
+                self._publish_alignment_command_timing(
+                    sequence_id,
+                    original_stamp_ns,
+                    callback_ros_ns,
+                    callback_monotonic_ns,
+                    sdk_start_ns,
+                    sdk_end_ns,
+                    accepted,
+                    rejection_code,
+                    rejection_reason,
+                )
             return
 
         joint_pos = {}
         for idx, joint_name in enumerate(msg.name):
             joint_pos[joint_name] = self._safe_get_value(msg.position, idx)
         joints = [joint_pos.get(i, 0) for i in self.arm_joint_names]
-        self.agx_arm.move_js(joints)
-        self.is_mit_mode = True
+        sdk_start_ns = time.monotonic_ns()
+        try:
+            self.agx_arm.move_js(joints)
+            accepted = True
+            self.is_mit_mode = True
+        except Exception as exc:
+            rejection_code = REJECTION_SDK_ERROR
+            rejection_reason = f"move_js SDK call failed: {exc}"
+            if sequence_id is None:
+                raise
+            self.get_logger().error(rejection_reason)
+        finally:
+            sdk_end_ns = time.monotonic_ns()
+        if sequence_id is not None:
+            self._publish_alignment_command_timing(
+                sequence_id,
+                original_stamp_ns,
+                callback_ros_ns,
+                callback_monotonic_ns,
+                sdk_start_ns,
+                sdk_end_ns,
+                accepted,
+                rejection_code,
+                rejection_reason,
+            )
+
+    def _publish_alignment_command_timing(
+        self,
+        sequence_id,
+        original_stamp_ns,
+        callback_ros_ns,
+        callback_monotonic_ns,
+        sdk_start_ns,
+        sdk_end_ns,
+        accepted,
+        rejection_code,
+        rejection_reason,
+    ):
+        if self.alignment_command_timing_pub.get_subscription_count() <= 0:
+            return
+        message = AlignmentCommandTiming()
+        message.sequence_id = int(sequence_id)
+        message.original_command_ros_timestamp_ns = int(original_stamp_ns)
+        message.driver_callback_ros_timestamp_ns = int(callback_ros_ns)
+        message.driver_callback_monotonic_ns = int(callback_monotonic_ns)
+        message.sdk_call_start_monotonic_ns = int(sdk_start_ns)
+        message.sdk_call_end_monotonic_ns = int(sdk_end_ns)
+        message.accepted = bool(accepted)
+        message.rejection_code = int(rejection_code)
+        message.rejection_reason = str(rejection_reason)
+        message.motion_mode = "move_js"
+        self.alignment_command_timing_pub.publish(message)
 
     def _move_mit_callback(self, msg: MoveMITMsg):
         if not self._check_can_control():
@@ -1030,6 +1272,126 @@ class AgxArmRosNode(Node):
                     self.get_logger().info("Agx_arm moved to home position successfully")
         except Exception as e:
             self.get_logger().error(f"Failed to move to home position: {str(e)}")
+        return response
+
+    def _get_alignment_metadata_callback(self, request, response):
+        del request
+        firmware_version = ""
+        if isinstance(self.firmware, dict):
+            firmware_version = str(self.firmware.get("software_version", ""))
+        response.firmware_version = firmware_version
+        response.firmware_version_valid = bool(firmware_version)
+
+        try:
+            response.pyagxarm_version = importlib.metadata.version("pyAgxArm")
+            response.pyagxarm_version_valid = bool(response.pyagxarm_version)
+        except importlib.metadata.PackageNotFoundError:
+            response.pyagxarm_version = str(
+                getattr(pyAgxArm, "__version__", "")
+            )
+            response.pyagxarm_version_valid = bool(response.pyagxarm_version)
+
+        pyagxarm_commit, pyagxarm_commit_valid = self._repository_commit(
+            Path(pyAgxArm.__file__)
+        )
+        response.pyagxarm_git_commit = pyagxarm_commit
+        response.pyagxarm_git_commit_valid = pyagxarm_commit_valid
+        driver_commit, driver_commit_valid = self._repository_commit(
+            Path(__file__)
+        )
+        response.agx_arm_ros_git_commit = driver_commit
+        response.agx_arm_ros_git_commit_valid = driver_commit_valid
+
+        can_config = (
+            self.arm_config.get("comm", {}).get("can", {})
+            if isinstance(self.arm_config, dict)
+            else {}
+        )
+        response.can_interface = str(can_config.get("interface", ""))
+        response.can_channel = str(can_config.get("channel", self.can_port))
+        response.can_bitrate = int(can_config.get("bitrate", 0))
+        response.can_configuration_valid = bool(
+            response.can_interface
+            and response.can_channel
+            and response.can_bitrate > 0
+        )
+        response.feedback_publication_rate_hz = float(self.pub_rate)
+        response.driver_state_publication_rate_hz = float(
+            self.alignment_driver_state_rate_hz
+        )
+        response.publication_rates_valid = bool(
+            response.feedback_publication_rate_hz > 0.0
+            and response.driver_state_publication_rate_hz > 0.0
+        )
+        response.end_effector_type = str(self.effector_type)
+
+        lower = [math.nan] * 7
+        upper = [math.nan] * 7
+        velocity = [math.nan] * 7
+        angle_velocity_valid = [False] * 7
+        acceleration = [math.nan] * 7
+        acceleration_valid = [False] * 7
+        if self.is_nero and self.arm_joint_count == 7:
+            for row in range(7):
+                joint_index = row + 1
+                try:
+                    limits = self.agx_arm.get_joint_angle_vel_limits(
+                        joint_index, timeout=1.0, min_interval=0.0
+                    )
+                    if limits is not None:
+                        values = (
+                            float(limits.msg.min_angle_limit),
+                            float(limits.msg.max_angle_limit),
+                            float(limits.msg.max_joint_spd),
+                        )
+                        if all(math.isfinite(value) for value in values):
+                            lower[row], upper[row], velocity[row] = values
+                            angle_velocity_valid[row] = True
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"alignment joint {joint_index} limit query failed: {exc}"
+                    )
+                try:
+                    limits = self.agx_arm.get_joint_acc_limits(
+                        joint_index, timeout=1.0, min_interval=0.0
+                    )
+                    if limits is not None:
+                        value = float(limits.msg.max_joint_acc)
+                        if math.isfinite(value):
+                            acceleration[row] = value
+                            acceleration_valid[row] = True
+                except Exception as exc:
+                    self.get_logger().warn(
+                        "alignment joint "
+                        f"{joint_index} acceleration query failed: {exc}"
+                    )
+
+        response.joint_angle_lower_rad = lower
+        response.joint_angle_upper_rad = upper
+        response.joint_velocity_limit_rad_s = velocity
+        response.joint_angle_velocity_limit_valid = angle_velocity_valid
+        response.joint_acceleration_limit_rad_s2 = acceleration
+        response.joint_acceleration_limit_valid = acceleration_valid
+        response.torque_semantics = (
+            "output_joint_torque_from_current_fit_and_gear_ratio"
+            if self.is_nero
+            else "unknown"
+        )
+        response.torque_semantics_valid = bool(self.is_nero)
+
+        complete = (
+            response.firmware_version_valid
+            and response.can_configuration_valid
+            and response.publication_rates_valid
+            and all(angle_velocity_valid)
+            and all(acceleration_valid)
+        )
+        response.success = bool(complete)
+        response.message = (
+            "alignment metadata and all seven joint limits are available"
+            if complete
+            else "alignment metadata is incomplete; inspect validity fields"
+        )
         return response
 
     def _control_gate_callback(self, request, response):

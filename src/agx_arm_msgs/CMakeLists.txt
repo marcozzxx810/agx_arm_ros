@@ -16,12 +16,18 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AgxArmStatus.msg"
+  "msg/AlignmentCommandTiming.msg"
+  "msg/ArmStatusEvent.msg"
+  "msg/DriverStateEvent.msg"
   "msg/GripperStatus.msg"
   "msg/HandStatus.msg"
   "msg/HandCmd.msg"
   "msg/HandPositionTimeCmd.msg"
   "msg/JointStateTiming.msg"
+  "msg/JointAngleEvent.msg"
+  "msg/MotorStateEvent.msg"
   "msg/MoveMITMsg.msg"
+  "srv/GetAlignmentMetadata.srv"
   DEPENDENCIES builtin_interfaces std_msgs geometry_msgs
 )
 

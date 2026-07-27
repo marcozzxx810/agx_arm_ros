@@ -1,0 +1,11 @@
+# Timing/result emitted by the ROS driver for one tagged alignment move_js command.
+uint64 sequence_id
+int64 original_command_ros_timestamp_ns
+int64 driver_callback_ros_timestamp_ns
+int64 driver_callback_monotonic_ns
+int64 sdk_call_start_monotonic_ns
+int64 sdk_call_end_monotonic_ns
+bool accepted
+uint16 rejection_code
+string rejection_reason
+string motion_mode

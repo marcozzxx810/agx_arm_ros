@@ -1,0 +1,28 @@
+# Empty request: this service only reads cached/queryable driver information.
+---
+bool success
+string message
+string firmware_version
+bool firmware_version_valid
+string pyagxarm_version
+bool pyagxarm_version_valid
+string pyagxarm_git_commit
+bool pyagxarm_git_commit_valid
+string agx_arm_ros_git_commit
+bool agx_arm_ros_git_commit_valid
+string can_interface
+string can_channel
+uint32 can_bitrate
+bool can_configuration_valid
+float64 feedback_publication_rate_hz
+float64 driver_state_publication_rate_hz
+bool publication_rates_valid
+string end_effector_type
+float64[7] joint_angle_lower_rad
+float64[7] joint_angle_upper_rad
+float64[7] joint_velocity_limit_rad_s
+bool[7] joint_angle_velocity_limit_valid
+float64[7] joint_acceleration_limit_rad_s2
+bool[7] joint_acceleration_limit_valid
+string torque_semantics
+bool torque_semantics_valid
