@@ -178,6 +178,12 @@ class AgxGripperWrapper:
             return False
         
         return self._effector.disable_gripper()
+
+    def reset(self) -> bool:
+        if not self._initialized or self._effector is None:
+            return False
+
+        return self._effector.reset_gripper()
     
     def calibrate(self, timeout: float = 1.0) -> bool:
         if not self._initialized or self._effector is None:

@@ -14,7 +14,7 @@ from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, PiperFW, Ne
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from builtin_interfaces.msg import Time
-from std_srvs.srv import SetBool, Empty
+from std_srvs.srv import SetBool, Empty, Trigger
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray
 from scipy.spatial.transform import Rotation as R
 
@@ -502,6 +502,12 @@ class AgxArmRosNode(Node):
             "get_alignment_metadata",
             self._get_alignment_metadata_callback,
         )
+        if self.gripper is not None:
+            self.create_service(
+                Trigger,
+                "calibrate_gripper_zero",
+                self._calibrate_gripper_zero_callback,
+            )
         if not self.is_switch_seamlessly:
             self.create_service(Empty, "exit_teach_mode", self._exit_teach_mode_callback)
 
@@ -1401,6 +1407,58 @@ class AgxArmRosNode(Node):
         response.success = True
         response.message = f"External control gate {state}"
         self.get_logger().info(response.message)
+        return response
+
+    def _calibrate_gripper_zero_callback(self, request, response):
+        """Calibrate only a healthy, physically closed gripper with the gate closed."""
+        del request
+        if self.gripper is None:
+            response.success = False
+            response.message = "AGX gripper is unavailable"
+            return response
+        if self.control_enabled:
+            response.success = False
+            response.message = "close the external control gate before calibration"
+            return response
+        status = self.gripper.get_status()
+        if status is None or status.hz <= 0:
+            response.success = False
+            response.message = "fresh gripper feedback is unavailable"
+            return response
+        if abs(float(status.width)) > 0.002:
+            response.success = False
+            response.message = (
+                f"gripper must be physically closed; measured width={status.width:.4f}m"
+            )
+            return response
+        fault_names = (
+            "voltage_too_low",
+            "motor_overheating",
+            "driver_overcurrent",
+            "driver_overheating",
+            "sensor_status",
+            "driver_error_status",
+        )
+        active_faults = [name for name in fault_names if bool(getattr(status, name))]
+        if active_faults:
+            response.success = False
+            response.message = f"gripper faults prevent calibration: {active_faults}"
+            return response
+        if not self.gripper.reset():
+            response.success = False
+            response.message = "gripper reset command failed"
+            return response
+        time.sleep(0.2)
+        response.success = bool(self.gripper.calibrate(timeout=2.0))
+        response.message = (
+            "gripper zero calibrated at the confirmed closed position"
+            if response.success
+            else "gripper zero calibration timed out"
+        )
+        if response.success:
+            self.get_logger().info(response.message)
+        else:
+            self.get_logger().error(response.message)
         return response
 
     def _emergency_stop_callback(self, request, response):
