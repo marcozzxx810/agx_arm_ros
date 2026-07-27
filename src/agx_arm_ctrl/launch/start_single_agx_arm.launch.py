@@ -132,6 +132,7 @@ def generate_launch_description():
         remappings=[
             # feedback topics
             ('feedback/joint_states', 'feedback/joint_states'),
+            ('feedback/joint_state_timing', 'feedback/joint_state_timing'),
             ('feedback/tcp_pose', 'feedback/tcp_pose'),
             ('feedback/arm_status', 'feedback/arm_status'),
             ('feedback/leader_joint_states', 'feedback/leader_joint_states'),

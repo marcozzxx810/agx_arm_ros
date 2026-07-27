@@ -17,7 +17,7 @@ from scipy.spatial.transform import Rotation as R
 from agx_arm_msgs.msg import (
     AgxArmStatus, GripperStatus,
     HandStatus, HandCmd, HandPositionTimeCmd,
-    MoveMITMsg
+    JointStateTiming, MoveMITMsg
 )
 from agx_arm_ctrl.effector import AgxGripperWrapper, Revo2Wrapper, Revo2TouchWrapper
 
@@ -389,6 +389,9 @@ class AgxArmRosNode(Node):
         self.joint_states_pub = self.create_publisher(
             JointState, "feedback/joint_states", 1
         )
+        self.joint_state_timing_pub = self.create_publisher(
+            JointStateTiming, "feedback/joint_state_timing", 20
+        )
         # self.flange_pose_pub = self.create_publisher(
         #     PoseStamped, "feedback/flange_pose", 1
         # )
@@ -621,15 +624,16 @@ class AgxArmRosNode(Node):
 
         velocitys = []
         efforts = []
+        motor_hardware_stamps = []
         for joint_index in range(1, self.arm_joint_count+1):
             ms = self.agx_arm.get_motor_states(joint_index)
             if ms is None:
                 return
             velocitys.append(ms.msg.velocity)
             efforts.append(ms.msg.torque)
-
-        msg = JointState()
-        msg.header.stamp = self._float_to_ros_time(joint_states.timestamp)
+            motor_hardware_stamps.append(
+                self._float_to_ros_time(ms.timestamp)
+            )
         
         joints_data = []
         # arm
@@ -642,8 +646,22 @@ class AgxArmRosNode(Node):
         # hand
         joints_data.extend(self._get_hand_joint_data())
         if joints_data:
+            # This is the timestamp of the complete, newly assembled ROS
+            # snapshot. Individual CAN receive times remain provenance only
+            # and are published separately below.
+            snapshot_stamp = self.get_clock().now().to_msg()
+            msg = JointState()
+            msg.header.stamp = snapshot_stamp
             msg.name, msg.position, msg.velocity, msg.effort =map(list, zip(*joints_data))
             self.joint_states_pub.publish(msg)
+
+            timing = JointStateTiming()
+            timing.header.stamp = snapshot_stamp
+            timing.position_hardware_stamp = self._float_to_ros_time(
+                joint_states.timestamp
+            )
+            timing.motor_hardware_stamps = motor_hardware_stamps
+            self.joint_state_timing_pub.publish(timing)
 
     def _publish_pose(self):
         flange_pose = self.agx_arm.get_flange_pose()
