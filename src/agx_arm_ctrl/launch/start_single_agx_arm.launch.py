@@ -92,6 +92,34 @@ def generate_launch_description():
         description='Default effort for gripper commands (>= 0.0).'
     )
 
+    leader_gripper_max_range_arg = DeclareLaunchArgument(
+        'leader_gripper_max_range_m',
+        default_value='0.0',
+        description=(
+            'Expected leader gripper teaching range: 0.0 preserves the '
+            'controller setting; supported configured values are 0.07 or 0.1 m.'
+        ),
+    )
+
+    leader_gripper_teaching_friction_arg = DeclareLaunchArgument(
+        'leader_gripper_teaching_friction',
+        default_value='0',
+        description=(
+            'Leader gripper teaching sensitivity: 0 preserves the controller '
+            'setting; supported configured values are 1..10.'
+        ),
+    )
+
+    leader_gripper_reset_arg = DeclareLaunchArgument(
+        'leader_gripper_reset_on_start',
+        default_value='false',
+        choices=['true', 'false'],
+        description=(
+            'Clear and temporarily disable the gripper before entering NERO '
+            'leader mode; re-enable it at its measured width before switching.'
+        ),
+    )
+
     control_enabled_arg = DeclareLaunchArgument(
         'control_enabled',
         default_value='true',
@@ -134,6 +162,15 @@ def generate_launch_description():
             'revo2_type': LaunchConfiguration('revo2_type'),
             'tcp_offset': LaunchConfiguration('tcp_offset'),
             'gripper_default_effort': LaunchConfiguration('gripper_default_effort'),
+            'leader_gripper_max_range_m': LaunchConfiguration(
+                'leader_gripper_max_range_m'
+            ),
+            'leader_gripper_teaching_friction': LaunchConfiguration(
+                'leader_gripper_teaching_friction'
+            ),
+            'leader_gripper_reset_on_start': LaunchConfiguration(
+                'leader_gripper_reset_on_start'
+            ),
             'control_enabled': LaunchConfiguration('control_enabled'),
             'physical_mode': LaunchConfiguration('physical_mode'),
             'alignment_driver_state_rate_hz': LaunchConfiguration(
@@ -191,6 +228,9 @@ def generate_launch_description():
         enable_timeout_arg,
         tcp_offset_arg,
         gripper_default_effort_arg,
+        leader_gripper_max_range_arg,
+        leader_gripper_teaching_friction_arg,
+        leader_gripper_reset_arg,
         control_enabled_arg,
         physical_mode_arg,
         alignment_driver_state_rate_arg,

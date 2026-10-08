@@ -99,7 +99,8 @@ class AgxArmRosNode(Node):
         self._init_agx_arm()
 
         ### effector
-        self._init_effector()
+        if not hasattr(self, "gripper"):
+            self._init_effector()
 
         ### publishers
         self._setup_publishers()
@@ -127,6 +128,9 @@ class AgxArmRosNode(Node):
         self.declare_parameter("revo2_type", "left")
         self.declare_parameter("tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("gripper_default_effort", 1.0)
+        self.declare_parameter("leader_gripper_max_range_m", 0.0)
+        self.declare_parameter("leader_gripper_teaching_friction", 0)
+        self.declare_parameter("leader_gripper_reset_on_start", False)
         self.declare_parameter("control_enabled", True)
         self.declare_parameter("physical_mode", "unchanged")
         self.declare_parameter("alignment_driver_state_rate_hz", 5.0)
@@ -143,6 +147,15 @@ class AgxArmRosNode(Node):
         self.revo2_type = self.get_parameter("revo2_type").value
         self.tcp_offset = self.get_parameter("tcp_offset").value
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
+        self.leader_gripper_max_range_m = float(
+            self.get_parameter("leader_gripper_max_range_m").value
+        )
+        self.leader_gripper_teaching_friction = int(
+            self.get_parameter("leader_gripper_teaching_friction").value
+        )
+        self.leader_gripper_reset_on_start = bool(
+            self.get_parameter("leader_gripper_reset_on_start").value
+        )
         self.control_enabled = self.get_parameter("control_enabled").value
         self.physical_mode = self.get_parameter("physical_mode").value
         self.alignment_driver_state_rate_hz = float(
@@ -173,6 +186,16 @@ class AgxArmRosNode(Node):
                 "Setting it to default value 1.0"
             )
             self.gripper_default_effort = 1.0
+        if self.leader_gripper_max_range_m not in (0.0, 0.07, 0.1):
+            self.get_logger().error(
+                "leader_gripper_max_range_m must be 0.0 (preserve), 0.07, or 0.1"
+            )
+            exit(1)
+        if self.leader_gripper_teaching_friction not in range(0, 11):
+            self.get_logger().error(
+                "leader_gripper_teaching_friction must be 0 (preserve) or 1..10"
+            )
+            exit(1)
 
         ### variables
         self.is_piper = "piper" in self.arm_type
@@ -201,6 +224,17 @@ class AgxArmRosNode(Node):
             self.get_logger().info(f"revo2_type: {self.revo2_type}")
         self.get_logger().info(f"tcp_offset: {self.tcp_offset}")
         self.get_logger().info(f"gripper_default_effort: {self.gripper_default_effort}")
+        self.get_logger().info(
+            f"leader_gripper_max_range_m: {self.leader_gripper_max_range_m}"
+        )
+        self.get_logger().info(
+            "leader_gripper_teaching_friction: "
+            f"{self.leader_gripper_teaching_friction}"
+        )
+        self.get_logger().info(
+            "leader_gripper_reset_on_start: "
+            f"{self.leader_gripper_reset_on_start}"
+        )
         self.get_logger().info(f"control_enabled: {self.control_enabled}")
         self.get_logger().info(f"physical_mode: {self.physical_mode}")
         self.get_logger().info(
@@ -214,6 +248,8 @@ class AgxArmRosNode(Node):
         if match is None:
             raise RuntimeError(f"Unsupported NERO firmware string: {version!r}")
         parsed = (int(match.group(1)), int(match.group(2)))
+        if parsed >= (1, 21):
+            return NeroFW.V121
         if parsed >= (1, 20):
             return NeroFW.V120
         if parsed >= (1, 12):
@@ -282,9 +318,9 @@ class AgxArmRosNode(Node):
             self.agx_arm.set_leader_mode()
         else:
             self.agx_arm.set_follower_mode()
-            # Changing linkage disables the normal CAN push on firmware 1.20.
-            # Re-enabling the already-powered joints restores follower status
-            # and measured-joint feedback without sending a joint target.
+            # The versioned SDK restores normal CAN push when selecting
+            # follower mode. Confirm the already-powered joints are enabled
+            # before verifying status, without sending a joint target.
             if not self._enable_arm(True, self.enable_timeout):
                 raise RuntimeError(
                     "failed to restore NERO follower feedback after mode change"
@@ -373,8 +409,54 @@ class AgxArmRosNode(Node):
 
         self.agx_arm.set_speed_percent(self.speed_percent)
         self.agx_arm.set_tcp_offset(self.tcp_offset)
+        if self.is_nero:
+            version = getattr(self.agx_arm, "EEF_FEEDBACK_VERSION", "legacy_frame_caches")
+            self.get_logger().info(f"EEF feedback assembly: {version}")
         self.arm_config = config
+        if (
+            self.is_nero
+            and self.physical_mode == "leader"
+            and self.effector_type == "agx_gripper"
+            and (
+                self.leader_gripper_max_range_m > 0.0
+                or self.leader_gripper_teaching_friction > 0
+                or self.leader_gripper_reset_on_start
+            )
+        ):
+            # Initialize and validate the leader gripper while normal
+            # follower-mode request/response feedback is still available.
+            # NERO 1.20 suppresses that feedback after entering leader mode.
+            self._enter_follower_mode_for_leader_gripper_setup()
+            self._init_effector()
+            self._prepare_leader_gripper()
         self._configure_physical_mode()
+
+    def _enter_follower_mode_for_leader_gripper_setup(self):
+        previous = self.agx_arm.get_arm_status()
+        previous_timestamp = float(previous.timestamp) if previous is not None else 0.0
+        self.agx_arm.set_follower_mode()
+        if not self._enable_arm(True, self.enable_timeout):
+            raise RuntimeError(
+                "failed to enable NERO for leader gripper setup"
+            )
+
+        deadline = time.monotonic() + float(self.enable_timeout)
+        while time.monotonic() < deadline:
+            status = self.agx_arm.get_arm_status()
+            if (
+                status is not None
+                and status.hz > 0
+                and float(status.timestamp) > previous_timestamp
+                and status.msg.ctrl_mode == 1
+            ):
+                self.get_logger().info(
+                    "NERO follower feedback ready for leader gripper setup"
+                )
+                return
+            time.sleep(0.01)
+        raise RuntimeError(
+            "NERO did not enter follower mode for leader gripper setup"
+        )
 
     def _init_effector(self):
         self.gripper: Optional[AgxGripperWrapper] = None
@@ -401,6 +483,177 @@ class AgxArmRosNode(Node):
             else:
                 self.get_logger().error("Failed to initialize Revo2 Touch hand")
                 self.hand = None
+
+    def _prepare_leader_gripper(self):
+        target_range = self.leader_gripper_max_range_m
+        target_friction = self.leader_gripper_teaching_friction
+        if (
+            not self.is_nero
+            or self.physical_mode != "leader"
+            or self.gripper is None
+        ):
+            return
+
+        if target_range > 0.0 or target_friction > 0:
+            teaching = self.gripper.get_teaching_param(
+                timeout=min(float(self.enable_timeout), 2.0),
+                min_interval=0.0,
+            )
+            if teaching is None:
+                raise RuntimeError(
+                    "leader gripper teaching parameters are unavailable before "
+                    "entering leader mode"
+                )
+
+            desired_range = (
+                target_range
+                if target_range > 0.0
+                else float(teaching.max_range_config)
+            )
+            desired_friction = (
+                target_friction
+                if target_friction > 0
+                else int(teaching.teaching_friction)
+            )
+            range_matches = (
+                abs(float(teaching.max_range_config) - desired_range) <= 0.001
+            )
+            friction_matches = (
+                int(teaching.teaching_friction) == desired_friction
+            )
+            if range_matches and friction_matches:
+                self.get_logger().info(
+                    "Leader gripper teaching parameters are "
+                    f"range={desired_range:.2f} m, friction={desired_friction}"
+                )
+            else:
+                previous_range = float(teaching.max_range_config)
+                previous_friction = int(teaching.teaching_friction)
+                write_confirmed = self.gripper.set_teaching_param(
+                    teaching_range_per=int(teaching.teaching_range_per),
+                    max_range_config=desired_range,
+                    teaching_friction=desired_friction,
+                    timeout=2.0,
+                )
+                if not write_confirmed:
+                    # NERO 1.20 can apply 0x47D and return the updated 0x47E
+                    # value without emitting the older 0x476 ACK expected by
+                    # the SDK. Treat matching read-back as authoritative.
+                    verified = self.gripper.get_teaching_param(
+                        timeout=1.0,
+                        min_interval=0.0,
+                    )
+                    write_confirmed = bool(
+                        verified is not None
+                        and abs(
+                            float(verified.max_range_config) - desired_range
+                        )
+                        <= 0.001
+                        and int(verified.teaching_friction)
+                        == desired_friction
+                    )
+                    if write_confirmed:
+                        self.get_logger().warn(
+                            "Leader gripper teaching parameters applied "
+                            "without a legacy ACK; verified by read-back"
+                        )
+                if not write_confirmed:
+                    raise RuntimeError(
+                        "failed to restore leader gripper teaching parameters"
+                    )
+                self.get_logger().warn(
+                    "Restored leader gripper teaching parameters from "
+                    f"range={previous_range:.2f} m, friction={previous_friction} "
+                    f"to range={desired_range:.2f} m, "
+                    f"friction={desired_friction}"
+                )
+
+        if self.leader_gripper_reset_on_start:
+            self._reset_leader_gripper_before_mode_switch()
+
+    def _reset_leader_gripper_before_mode_switch(self):
+        deadline = time.monotonic() + min(float(self.enable_timeout), 2.0)
+        status = None
+        while time.monotonic() < deadline:
+            candidate = self.gripper.get_status()
+            if candidate is not None and candidate.hz > 0:
+                status = candidate
+                break
+            time.sleep(0.01)
+        if status is None:
+            raise RuntimeError(
+                "fresh leader gripper status is unavailable before reset"
+            )
+        fault_names = (
+            "voltage_too_low",
+            "motor_overheating",
+            "driver_overcurrent",
+            "driver_overheating",
+            "sensor_status",
+            "driver_error_status",
+        )
+        active_faults = [
+            name for name in fault_names if bool(getattr(status, name))
+        ]
+        if active_faults:
+            raise RuntimeError(
+                f"leader gripper faults prevent reset: {active_faults}"
+            )
+        measured_width = float(status.width)
+        if not math.isfinite(measured_width):
+            raise RuntimeError("leader gripper width is invalid before reset")
+        resume_width = max(0.0, min(0.1, abs(measured_width)))
+        pre_reset_timestamp = float(status.timestamp)
+
+        # reset() sends the controller's disable-and-clear command. Its
+        # immediate bool reflects the pre-command cached status.  In
+        # particular, an already-disabled gripper would otherwise make the
+        # following check pass before the reset command has been processed.
+        # Require a CAN status frame newer than the one observed before reset.
+        self.gripper.reset()
+        deadline = time.monotonic() + min(float(self.enable_timeout), 2.0)
+        reset_complete = False
+        while time.monotonic() < deadline:
+            status = self.gripper.get_status()
+            if (
+                status is not None
+                and status.hz > 0
+                and float(status.timestamp) > pre_reset_timestamp
+                and not status.driver_enable_status
+            ):
+                reset_complete = True
+                break
+            time.sleep(0.01)
+        if not reset_complete:
+            raise RuntimeError(
+                "leader gripper reset did not reach disabled state"
+            )
+
+        # Re-enable at the measured pre-reset width so this recovery does not
+        # intentionally move the gripper. Leader mode then takes ownership of
+        # subsequent 0x159 commands.
+        pre_enable_timestamp = float(status.timestamp)
+        if not self.gripper.move(
+            width=resume_width,
+            force=self.gripper_default_effort,
+        ):
+            raise RuntimeError("failed to re-enable leader gripper after reset")
+        deadline = time.monotonic() + min(float(self.enable_timeout), 2.0)
+        while time.monotonic() < deadline:
+            status = self.gripper.get_status()
+            if (
+                status is not None
+                and status.hz > 0
+                and float(status.timestamp) > pre_enable_timestamp
+                and status.driver_enable_status
+            ):
+                self.get_logger().info(
+                    "Leader gripper reset and re-enabled at "
+                    f"{resume_width:.4f} m before entering leader mode"
+                )
+                return
+            time.sleep(0.01)
+        raise RuntimeError("leader gripper did not re-enable after reset")
 
     def _get_finger_position_max(self, finger_attr: str) -> float:
         if self.effector_type == "revo2_touch":
